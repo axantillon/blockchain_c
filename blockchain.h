@@ -1,6 +1,11 @@
 /**
  * blockchain.h
  * 
+ * CHANGES:
+ * - Reorganized function declarations into logical groups
+ * - Added helper function declarations
+ * - Improved comments for educational purposes
+ * 
  * Core blockchain data structures and operations.
  * Defines the transaction structure, chain operations, and system constants.
  * Provides interfaces for mining, transaction management, and chain validation.
@@ -20,6 +25,7 @@
 #include <openssl/rsa.h>
 #include <time.h>
 #include <assert.h>
+#include <stdint.h>
 
 // System constants
 #define HASH_SIZE SHA256_DIGEST_LENGTH
@@ -39,6 +45,16 @@
 #define MINING_REWARD_BUFFER_SIZE 18  // "BLOCKCHAIN_REWARD" + null
 #define CHAIN_FILE_VERSION 1
 
+// ------------------------------------------------------------------
+// Data Structures
+// ------------------------------------------------------------------
+
+/**
+ * Transaction
+ * 
+ * Represents a single transaction in the blockchain.
+ * Each transaction links to the previous one via prev_hash.
+ */
 typedef struct Transaction {
     char prev_hash[HASH_SIZE * 2 + 1];    // Hex string of previous hash
     char data_hash[HASH_SIZE * 2 + 1];    // Hex string of transaction data hash
@@ -51,12 +67,18 @@ typedef struct Transaction {
     struct Transaction* next;              // Next transaction in chain
 } Transaction;
 
+/**
+ * Chain File Header
+ * 
+ * Used for persistence to ensure compatibility and integrity.
+ */
 typedef struct ChainFileHeader {
     uint32_t version;
     uint32_t transaction_count;
     uint32_t checksum;  // Simple integrity check
 } ChainFileHeader;
 
+// Ensure our structure field sizes are sufficient
 static_assert(sizeof(((Transaction*)0)->sender) >= ADDRESS_BUFFER_SIZE, 
               "Sender address field too small");
 static_assert(sizeof(((Transaction*)0)->recipient) >= ADDRESS_BUFFER_SIZE, 
@@ -64,32 +86,60 @@ static_assert(sizeof(((Transaction*)0)->recipient) >= ADDRESS_BUFFER_SIZE,
 static_assert(sizeof(((Transaction*)0)->signature) >= HEX_SIG_SIZE, 
               "Signature field too small for RSA-2048 hex string");
 
-// Core blockchain operations
-int add_transaction(const char* recipient, double amount);  // Returns 1 on success, 0 on failure
-void mine_reward(void);  // Changed from mine_transaction
-void print_chain(void);
-Transaction* get_chain_head(void);
+// ------------------------------------------------------------------
+// Core Chain Operations
+// ------------------------------------------------------------------
 
-// Chain persistence
+// Chain access operations
+Transaction* get_chain_head(void);
+size_t get_transaction_count(void);
+
+// Transaction operations
+int add_transaction(const char* recipient, double amount);  // Returns 1 on success, 0 on failure
+int validate_transaction(Transaction* tx);  // Returns 1 if valid, 0 if invalid
+int is_double_spend(Transaction* tx);      // Returns 1 if double spend detected, 0 if ok
+
+// Mining operations
+void mine_reward(void);  // Mine a new block for current user
+
+// Chain inspection
+void print_chain(void);
+
+// ------------------------------------------------------------------
+// Chain Validation
+// ------------------------------------------------------------------
+
+int verify_chain_integrity(void);          // Returns 1 if chain is valid, 0 if corrupted
+
+// ------------------------------------------------------------------
+// Balance and Account Operations
+// ------------------------------------------------------------------
+
+double get_account_balance(const char* address);
+size_t get_active_accounts(void);
+double get_total_supply(void);
+
+// ------------------------------------------------------------------
+// Chain Persistence
+// ------------------------------------------------------------------
+
 int save_chain(void);  // Returns 1 on success, 0 on failure
 int load_chain(void);  // Returns 1 on success, 0 on failure
 void cleanup_chain(void);
 
-// Account operations
-double get_account_balance(const char* address);
+// ------------------------------------------------------------------
+// Chain Monitoring
+// ------------------------------------------------------------------
 
-// Validation operations
-int validate_transaction(Transaction* tx);  // Returns 1 if valid, 0 if invalid
-int verify_chain_integrity(void);          // Returns 1 if chain is valid, 0 if corrupted
-int is_double_spend(Transaction* tx);      // Returns 1 if double spend detected, 0 if ok
-
-// Statistics functions
-size_t get_transaction_count(void);
-size_t get_active_accounts(void);
-double get_total_supply(void);
-
-// Add these declarations
 time_t get_chain_modified_time(void);
 int has_chain_changed(void);
+
+// ------------------------------------------------------------------
+// Helper Functions
+// ------------------------------------------------------------------
+
+int validate_address_format(const char* address);
+int calculate_transaction_hash(Transaction* tx);
+void append_transaction_to_chain(Transaction* tx);
 
 #endif 

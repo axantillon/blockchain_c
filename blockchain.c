@@ -1,6 +1,11 @@
 /**
  * blockchain.c
  * 
+ * CHANGES:
+ * - Added set_chain_head function needed by blockchain_utils
+ * - Reduced code duplication by using utility functions
+ * - Improved code organization and comments
+ * 
  * Implementation of the blockchain core functionality.
  * Handles all blockchain operations including:
  * - Transaction creation and validation
@@ -16,6 +21,7 @@
 #include <string.h>
 #include <errno.h>
 #include "blockchain.h"
+#include "blockchain_utils.h"
 #include "crypto.h"
 #include <ctype.h>  // For isxdigit()
 #include <sys/stat.h>  // For stat()
@@ -27,6 +33,16 @@ static time_t last_known_time = 0;
 
 // Function prototypes for internal functions
 static int perform_proof_of_work(Transaction* tx, int check_updates);
+
+/**
+ * set_chain_head
+ * 
+ * Sets the head of the blockchain to the given transaction.
+ * ONLY to be used by blockchain_utils.c
+ */
+void set_chain_head(Transaction* tx) {
+    chain_head = tx;
+}
 
 /**
  * get_chain_head
@@ -83,10 +99,7 @@ int verify_chain_integrity(void) {
         }
 
         // Verify proof of work
-        char zeros[DIFFICULTY + 1];
-        memset(zeros, '0', DIFFICULTY);
-        zeros[DIFFICULTY] = '\0';
-        if (strncmp(current->data_hash, zeros, DIFFICULTY) != 0) {
+        if (strncmp(current->data_hash, get_difficulty_prefix(DIFFICULTY), DIFFICULTY) != 0) {
             printf("Error: Invalid proof of work\n");
             return 0;
         }
@@ -99,139 +112,103 @@ int verify_chain_integrity(void) {
                 return 0;
             }
         } else {
-            // Normal transaction validation
-            if (strlen(current->sender) != 8 || strncmp(current->sender, "0x", 2) != 0) {
-                printf("Error: Invalid sender address format\n");
+            // Normal transaction
+            // Verify address format
+            if (!validate_address_format(current->sender) || 
+                !validate_address_format(current->recipient)) {
                 return 0;
             }
-
-            // Verify transaction signature
+            
+            // Verify signature for non-reward transactions
             if (!verify_transaction(current)) {
                 printf("Error: Invalid transaction signature\n");
                 return 0;
             }
         }
         
-        // Always validate recipient
-        if (strlen(current->recipient) != 8 || strncmp(current->recipient, "0x", 2) != 0) {
-            printf("Error: Invalid recipient address format\n");
-            return 0;
-        }
-
+        // Save hash for next iteration
         prev_hash = current->data_hash;
         current = current->next;
     }
     
-    return 1;
+    return 1;  // Chain is valid
 }
 
 /**
  * mine_reward
  * 
- * Performs proof-of-work mining to create a reward block:
- * 1. Creates mining reward transaction
- * 2. Finds hash with required difficulty (leading zeros)
- * 3. Monitors for chain updates during mining
- * 4. Adds block to chain if successful
- * 
- * Mining can be interrupted if chain is updated by another instance
+ * Mines a new reward transaction for the current user.
+ * Performs proof-of-work to find a valid hash.
  */
 void mine_reward(void) {
-    // Check for updates before starting
-    if (has_chain_changed()) {
-        printf("\nChain updated by another instance, reloading...\n");
-        if (!load_chain()) {
-            printf("Warning: Failed to reload chain\n");
-            return;  // Don't start mining with outdated chain
-        }
-    }
-
     Transaction* tx = malloc(sizeof(Transaction));
     if (!tx) {
-        printf("Error: Memory allocation failed\n");
+        printf("Error: Failed to allocate transaction memory\n");
         return;
     }
     memset(tx, 0, sizeof(Transaction));
     
-    // Set mining reward transaction
-    const char* user_address = get_current_user_address();
-    strncpy(tx->recipient, user_address, sizeof(tx->recipient) - 1);
-    tx->recipient[sizeof(tx->recipient) - 1] = '\0';
-    
-    strncpy(tx->sender, MINING_REWARD_SENDER, sizeof(tx->sender) - 1);
-    tx->sender[sizeof(tx->sender) - 1] = '\0';
-    
+    // Set up mining reward transaction
+    safe_string_copy(tx->sender, MINING_REWARD_SENDER, sizeof(tx->sender));
+    safe_string_copy(tx->recipient, get_current_user_address(), sizeof(tx->recipient));
     tx->amount = MINING_REWARD;
-    tx->fee = 0;  // No fee for mining rewards
+    tx->fee = 0.0;  // No fee for mining rewards
     tx->timestamp = time(NULL);
     
-    // Get previous hash from the tail (newest transaction)
-    Transaction* tail = chain_head;
+    // Find previous hash from chain tail
+    Transaction* tail = find_chain_tail();
     if (tail != NULL) {
-        while (tail->next != NULL) {
-            tail = tail->next;
-        }
-        strncpy(tx->prev_hash, tail->data_hash, sizeof(tx->prev_hash) - 1);
-        tx->prev_hash[sizeof(tx->prev_hash) - 1] = '\0';
+        safe_string_copy(tx->prev_hash, tail->data_hash, sizeof(tx->prev_hash));
     } else {
+        // First transaction in the chain
         memset(tx->prev_hash, '0', sizeof(tx->prev_hash) - 1);
         tx->prev_hash[sizeof(tx->prev_hash) - 1] = '\0';
     }
     
-    printf("\n        MINING BLOCK\n");
-    printf("═══════════════════════════════════════\n");
+    // Generate initial hash
+    calculate_transaction_hash(tx);
     
+    // Perform proof of work
+    printf("Mining now, please wait...\n");
     if (!perform_proof_of_work(tx, 1)) {  // Check for updates
+        printf("Mining aborted\n");
         free(tx);
-        load_chain();
         return;
     }
     
-    printf("Reward  : %.2f AX\n", MINING_REWARD);
-    printf("═══════════════════════════════════════\n\n");
-    
-    // Add to chain (chronologically)
-    if (chain_head == NULL) {
-        chain_head = tx;
-    } else {
-        // Find tail
-        Transaction* current = chain_head;
-        while (current->next != NULL) {
-            current = current->next;
-        }
-        current->next = tx;
-    }
-    tx->next = NULL;  // Ensure new transaction is the tail
+    // Add to chain
+    append_transaction_to_chain(tx);
+    printf("Successfully mined %0.2f %s!\n", MINING_REWARD, CURRENCY_SYMBOL);
 }
 
 /**
  * get_account_balance
  * 
- * Calculates the current balance for an address by:
- * - Adding all received amounts
- * - Subtracting all sent amounts and fees
- * - Excluding mining rewards from fee calculations
+ * Calculates the balance of a given address by iterating through all transactions.
  * 
  * Parameters:
- *   address: The address to check balance for
+ *   address: The address to check
  * 
  * Returns:
- *   Current balance for the address
+ *   Current balance of the address
  */
 double get_account_balance(const char* address) {
+    if (!address) return 0.0;
+    
     double balance = 0.0;
     Transaction* current = chain_head;
     
     while (current != NULL) {
-        // Add received amounts
+        // Add received money
         if (strcmp(current->recipient, address) == 0) {
             balance += current->amount;
         }
-        // Subtract sent amounts (including fees)
-        if (strcmp(current->sender, address) == 0 && 
-            strcmp(current->sender, MINING_REWARD_SENDER) != 0) {
+        
+        // Subtract spent money
+        if (strcmp(current->sender, address) == 0) {
             balance -= (current->amount + current->fee);
         }
+        
         current = current->next;
     }
     
@@ -241,12 +218,12 @@ double get_account_balance(const char* address) {
 /**
  * print_chain
  * 
- * Displays the entire blockchain in a formatted view:
- * - Transaction details
- * - Mining rewards vs transfers
- * - Timestamps and amounts
- * - Technical details (hashes)
- * - Summary statistics
+ * Displays the entire blockchain transaction history.
+ * Shows details for each transaction including:
+ * - Transaction type
+ * - Sender and recipient addresses
+ * - Amount, fees, and timestamps
+ * - Hash details
  */
 void print_chain(void) {
     if (chain_head == NULL) {
@@ -282,11 +259,7 @@ void print_chain(void) {
         printf("Time     : %s\n", time_str);
         
         // Format addresses for better readability
-        if (strcmp(current->sender, MINING_REWARD_SENDER) == 0) {
-            printf("From     : System Mining Reward\n");
-        } else {
-            printf("From     : %s\n", current->sender);
-        }
+        printf("From     : %s\n", format_address_for_display(current->sender));
         printf("To       : %s\n", current->recipient);
         
         // Amount with currency symbol
@@ -329,6 +302,12 @@ void print_chain(void) {
  *   0 on any error
  */
 int save_chain(void) {
+    // First verify chain integrity before saving
+    if (!verify_chain_integrity()) {
+        printf("Error: Cannot save corrupted chain\n");
+        return 0;
+    }
+
     FILE* file = fopen(TEMP_CHAIN_FILE, "wb");
     if (!file) {
         printf("Error: Could not create temporary chain file: %s\n", strerror(errno));
@@ -349,52 +328,108 @@ int save_chain(void) {
         return 0;
     }
 
-    // Write transactions and calculate checksum
+    // Write transactions
     Transaction* current = chain_head;
     uint32_t checksum = 0;
+    
     while (current != NULL) {
-        // Update checksum
-        const unsigned char* data = (const unsigned char*)current;
-        for (size_t i = 0; i < sizeof(Transaction); i++) {
-            checksum = (checksum << 1) | (checksum >> 31);  // Rotate left
-            checksum ^= data[i];
-        }
-
+        // Write transaction
         if (fwrite(current, sizeof(Transaction), 1, file) != 1) {
             printf("Error: Failed to write transaction\n");
             fclose(file);
             remove(TEMP_CHAIN_FILE);
             return 0;
         }
-        current = current->next;
+        
+        // Update checksum (simple additive)
+        for (size_t i = 0; i < sizeof(Transaction); i++) {
+            checksum += ((unsigned char*)current)[i];
+        }
+        
+        // Set next to NULL in file (will be reconstructed on load)
+        Transaction* next = current->next;
+        long pos = ftell(file);
+        if (pos < 0) {
+            printf("Error: Failed to get file position\n");
+            fclose(file);
+            remove(TEMP_CHAIN_FILE);
+            return 0;
+        }
+        
+        // Go back to the next pointer position
+        if (fseek(file, pos - sizeof(Transaction*), SEEK_SET) != 0) {
+            printf("Error: Failed to seek in file\n");
+            fclose(file);
+            remove(TEMP_CHAIN_FILE);
+            return 0;
+        }
+        
+        // Write NULL as next pointer
+        Transaction* null_ptr = NULL;
+        if (fwrite(&null_ptr, sizeof(Transaction*), 1, file) != 1) {
+            printf("Error: Failed to write next pointer\n");
+            fclose(file);
+            remove(TEMP_CHAIN_FILE);
+            return 0;
+        }
+        
+        // Restore position
+        if (fseek(file, pos, SEEK_SET) != 0) {
+            printf("Error: Failed to restore file position\n");
+            fclose(file);
+            remove(TEMP_CHAIN_FILE);
+            return 0;
+        }
+        
+        current = next;
     }
-
-    // Write final checksum
-    fseek(file, offsetof(ChainFileHeader, checksum), SEEK_SET);
-    fwrite(&checksum, sizeof(checksum), 1, file);
-    fclose(file);
-
-    // Atomically replace old file
-    if (rename(TEMP_CHAIN_FILE, CHAIN_FILE) != 0) {
-        printf("Error: Failed to save chain file: %s\n", strerror(errno));
+    
+    // Update header with checksum
+    header.checksum = checksum;
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        printf("Error: Failed to seek to file start\n");
+        fclose(file);
         remove(TEMP_CHAIN_FILE);
         return 0;
     }
-
-    printf("Chain saved successfully (%u transactions)\n", header.transaction_count);
-    last_check_time = time(NULL);
+    
+    if (fwrite(&header, sizeof(header), 1, file) != 1) {
+        printf("Error: Failed to write updated header\n");
+        fclose(file);
+        remove(TEMP_CHAIN_FILE);
+        return 0;
+    }
+    
+    fclose(file);
+    
+    // Atomic update by renaming
+    if (remove(CHAIN_FILE) != 0 && errno != ENOENT) {
+        printf("Error: Failed to remove old chain file: %s\n", strerror(errno));
+        remove(TEMP_CHAIN_FILE);
+        return 0;
+    }
+    
+    if (rename(TEMP_CHAIN_FILE, CHAIN_FILE) != 0) {
+        printf("Error: Failed to rename chain file: %s\n", strerror(errno));
+        remove(TEMP_CHAIN_FILE);
+        return 0;
+    }
+    
+    // Update last known modified time
     last_known_time = get_chain_modified_time();
+    
+    printf("Chain saved successfully (%u transactions)\n", header.transaction_count);
     return 1;
 }
 
 /**
  * load_chain
  * 
- * Handles blockchain persistence with:
- * - Version checking
- * - Checksum validation
- * - Atomic file updates
- * - Chain integrity verification
+ * Loads blockchain from persistent storage:
+ * - Validates file format and version
+ * - Verifies checksum integrity
+ * - Reconstructs transaction linked list
+ * - Validates loaded chain
  * 
  * Returns:
  *   1 on success
@@ -403,86 +438,121 @@ int save_chain(void) {
 int load_chain(void) {
     FILE* file = fopen(CHAIN_FILE, "rb");
     if (!file) {
-        if (errno != ENOENT) {
+        if (errno == ENOENT) {
+            printf("No existing chain file found\n");
+        } else {
             printf("Error opening chain file: %s\n", strerror(errno));
         }
         return 0;
     }
-
-    // Read and verify header
+    
+    // Read header
     ChainFileHeader header;
     if (fread(&header, sizeof(header), 1, file) != 1) {
         printf("Error: Failed to read file header\n");
         fclose(file);
         return 0;
     }
-
+    
+    // Verify version
     if (header.version != CHAIN_FILE_VERSION) {
-        printf("Error: Incompatible chain file version\n");
+        printf("Error: Incompatible chain file version %u (expected %u)\n", 
+               header.version, CHAIN_FILE_VERSION);
         fclose(file);
         return 0;
     }
-
-    cleanup_chain();
-    Transaction* prev = NULL;
-    uint32_t checksum = 0;
-    size_t loaded_count = 0;
-
+    
     // Read transactions
-    Transaction tx;
-    while (fread(&tx, sizeof(Transaction), 1, file) == 1) {
-        // Update checksum
-        const unsigned char* data = (const unsigned char*)&tx;
-        for (size_t i = 0; i < sizeof(Transaction); i++) {
-            checksum = (checksum << 1) | (checksum >> 31);
-            checksum ^= data[i];
-        }
-
-        Transaction* new_tx = malloc(sizeof(Transaction));
-        if (!new_tx) {
+    Transaction* new_chain = NULL;
+    Transaction* tail = NULL;
+    uint32_t checksum = 0;
+    
+    for (uint32_t i = 0; i < header.transaction_count; i++) {
+        Transaction* tx = malloc(sizeof(Transaction));
+        if (!tx) {
             printf("Error: Memory allocation failed\n");
+            
+            // Cleanup already loaded chain
+            Transaction* current = new_chain;
+            while (current != NULL) {
+                Transaction* next = current->next;
+                free(current);
+                current = next;
+            }
+            
             fclose(file);
-            cleanup_chain();
             return 0;
         }
-
-        memcpy(new_tx, &tx, sizeof(Transaction));
-        new_tx->next = NULL;
-
-        if (prev == NULL) {
-            chain_head = new_tx;
-        } else {
-            prev->next = new_tx;
+        
+        // Read transaction
+        if (fread(tx, sizeof(Transaction), 1, file) != 1) {
+            printf("Error: Failed to read transaction %u\n", i);
+            free(tx);
+            
+            // Cleanup already loaded chain
+            Transaction* current = new_chain;
+            while (current != NULL) {
+                Transaction* next = current->next;
+                free(current);
+                current = next;
+            }
+            
+            fclose(file);
+            return 0;
         }
-        prev = new_tx;
-        loaded_count++;
+        
+        // Update checksum
+        for (size_t j = 0; j < sizeof(Transaction); j++) {
+            checksum += ((unsigned char*)tx)[j];
+        }
+        
+        // Set next to NULL (will be updated below)
+        tx->next = NULL;
+        
+        // Add to new chain
+        if (new_chain == NULL) {
+            new_chain = tx;
+            tail = tx;
+        } else {
+            tail->next = tx;
+            tail = tx;
+        }
     }
-
+    
     fclose(file);
-
-    // Verify transaction count and checksum
-    if (loaded_count != header.transaction_count) {
-        printf("Error: Transaction count mismatch\n");
-        cleanup_chain();
-        return 0;
-    }
-
+    
+    // Verify checksum
     if (checksum != header.checksum) {
-        printf("Error: Chain file corrupted (checksum mismatch)\n");
-        cleanup_chain();
+        printf("Error: Chain file checksum mismatch\n");
+        
+        // Cleanup loaded chain
+        Transaction* current = new_chain;
+        while (current != NULL) {
+            Transaction* next = current->next;
+            free(current);
+            current = next;
+        }
+        
         return 0;
     }
-
-    // Verify chain integrity
-    if (!verify_chain_integrity()) {
-        printf("Error: Chain integrity check failed\n");
-        cleanup_chain();
-        return 0;
-    }
-
-    printf("Chain loaded successfully (%u transactions)\n", (unsigned int)loaded_count);
-    last_check_time = time(NULL);
+    
+    // Clean up existing chain
+    cleanup_chain();
+    
+    // Set new chain
+    chain_head = new_chain;
+    
+    // Update last known modified time
     last_known_time = get_chain_modified_time();
+    last_check_time = time(NULL);
+    
+    // Verify loaded chain integrity
+    if (!verify_chain_integrity()) {
+        printf("Warning: Loaded chain failed integrity check\n");
+        return 0;
+    }
+    
+    printf("Loaded %u transactions from chain file\n", header.transaction_count);
     return 1;
 }
 
@@ -522,6 +592,29 @@ void cleanup_chain(void) {
  *   0 if validation fails
  */
 int add_transaction(const char* recipient, double amount) {
+    // Validate recipient address format
+    if (!validate_address_format(recipient)) {
+        return 0;
+    }
+    
+    // Validate amount
+    if (amount <= 0) {
+        printf("Error: Transaction amount must be positive\n");
+        return 0;
+    }
+    
+    // Get sender address
+    const char* sender_address = get_current_user_address();
+    
+    // Check sender balance
+    double balance = get_account_balance(sender_address);
+    if (balance < amount + TRANSACTION_FEE) {
+        printf("Error: Insufficient balance (%.2f %s). Need %.2f %s\n", 
+               balance, CURRENCY_SYMBOL, amount + TRANSACTION_FEE, CURRENCY_SYMBOL);
+        return 0;
+    }
+    
+    // Create new transaction
     Transaction* tx = malloc(sizeof(Transaction));
     if (!tx) {
         printf("Error: Memory allocation failed\n");
@@ -530,65 +623,35 @@ int add_transaction(const char* recipient, double amount) {
     memset(tx, 0, sizeof(Transaction));
     
     // Set transaction details
-    strncpy(tx->recipient, recipient, sizeof(tx->recipient) - 1);
-    tx->recipient[sizeof(tx->recipient) - 1] = '\0';
-    
-    // Get and validate sender address before setting
-    const char* sender_address = get_current_user_address();
-    if (!sender_address) {
-        printf("Error: Could not get sender address\n");
-        free(tx);
-        return 0;
-    }
-    
-    // Copy sender address with explicit length check
-    size_t sender_len = strlen(sender_address);
-    if (sender_len != 8 || strncmp(sender_address, "0x", 2) != 0) {
-        printf("Error: Invalid sender address format\n");
-        free(tx);
-        return 0;
-    }
-    
-    // Use strncpy for the sender address
-    strncpy(tx->sender, sender_address, sizeof(tx->sender) - 1);
-    tx->sender[sizeof(tx->sender) - 1] = '\0';
-    
+    safe_string_copy(tx->recipient, recipient, sizeof(tx->recipient));
+    safe_string_copy(tx->sender, sender_address, sizeof(tx->sender));
     tx->amount = amount;
     tx->fee = TRANSACTION_FEE;
     tx->timestamp = time(NULL);
     
-    // Get previous hash from the tail (newest transaction)
-    Transaction* tail = chain_head;
+    // Get previous hash from chain tail
+    Transaction* tail = find_chain_tail();
     if (tail != NULL) {
-        while (tail->next != NULL) {
-            tail = tail->next;
-        }
-        strncpy(tx->prev_hash, tail->data_hash, sizeof(tx->prev_hash) - 1);
-        tx->prev_hash[sizeof(tx->prev_hash) - 1] = '\0';
+        safe_string_copy(tx->prev_hash, tail->data_hash, sizeof(tx->prev_hash));
     } else {
+        // First transaction in the chain
         memset(tx->prev_hash, '0', sizeof(tx->prev_hash) - 1);
         tx->prev_hash[sizeof(tx->prev_hash) - 1] = '\0';
     }
     
     // Generate data hash
-    char data[512];
-    snprintf(data, sizeof(data), "%s%s%.2f%.2f%s%ld",
-            tx->sender, tx->recipient, tx->amount, tx->fee,
-            tx->prev_hash, tx->timestamp);
-    generate_hash(data, strlen(data), tx->data_hash);
-    tx->data_hash[sizeof(tx->data_hash) - 1] = '\0';
+    calculate_transaction_hash(tx);
     
-    // Make a backup of the sender address
+    // Make a backup of the sender address (protection against sign_transaction modifying the sender)
     char backup_sender[ADDRESS_BUFFER_SIZE];
-    strncpy(backup_sender, tx->sender, sizeof(backup_sender));
+    safe_string_copy(backup_sender, tx->sender, sizeof(backup_sender));
     
     // Sign transaction
     sign_transaction(tx);
     
     // Verify sender wasn't corrupted
     if (strcmp(tx->sender, backup_sender) != 0) {
-        strncpy(tx->sender, backup_sender, sizeof(tx->sender) - 1);
-        tx->sender[sizeof(tx->sender) - 1] = '\0';
+        safe_string_copy(tx->sender, backup_sender, sizeof(tx->sender));
     }
     
     // Validate transaction
@@ -597,23 +660,14 @@ int add_transaction(const char* recipient, double amount) {
         return 0;
     }
     
+    // Perform proof of work
     if (!perform_proof_of_work(tx, 0)) {  // Don't check for updates
         free(tx);
         return 0;
     }
     
-    // Add to chain (chronologically)
-    if (chain_head == NULL) {
-        chain_head = tx;
-    } else {
-        // Find tail
-        Transaction* current = chain_head;
-        while (current->next != NULL) {
-            current = current->next;
-        }
-        current->next = tx;
-    }
-    tx->next = NULL;  // Ensure new transaction is the tail
+    // Add to chain
+    append_transaction_to_chain(tx);
     
     printf("Transaction added successfully! Fee of %.2f %s burned\n", 
            TRANSACTION_FEE, CURRENCY_SYMBOL);
@@ -645,15 +699,15 @@ int validate_transaction(Transaction* tx) {
         return tx->amount == MINING_REWARD && tx->fee == 0;
     }
 
-    // Add zero amount check
-    if (tx->amount <= 0) {
-        printf("Error: Transaction amount must be positive\n");
-        return 0;
-    }
-
     // Check for double spend
     if (is_double_spend(tx)) {
         printf("Error: Double spend detected\n");
+        return 0;
+    }
+
+    // Verify transaction amount is positive
+    if (tx->amount <= 0) {
+        printf("Error: Transaction amount must be positive\n");
         return 0;
     }
 
@@ -662,51 +716,12 @@ int validate_transaction(Transaction* tx) {
     printf("  Sender: '%s' (len: %zu)\n", tx->sender, strlen(tx->sender));
     printf("  Recipient: '%s' (len: %zu)\n", tx->recipient, strlen(tx->recipient));
 
-    // Verify address format
-    if (!tx->sender[0] || !tx->recipient[0]) {
-        printf("Error: Empty address\n");
-        return 0;
-    }
-
-    // Check address length (including '0x' prefix)
-    if (strlen(tx->sender) != 8) {
-        printf("Error: Invalid sender address length %zu (expected 8)\n", strlen(tx->sender));
+    // Verify address format for both sender and recipient
+    if (!validate_address_format(tx->sender)) {
         return 0;
     }
     
-    if (strlen(tx->recipient) != 8) {
-        printf("Error: Invalid recipient address length %zu (expected 8)\n", strlen(tx->recipient));
-        return 0;
-    }
-
-    // Check '0x' prefix
-    if (strncmp(tx->sender, "0x", 2) != 0) {
-        printf("Error: Sender address must start with '0x'\n");
-        return 0;
-    }
-    
-    if (strncmp(tx->recipient, "0x", 2) != 0) {
-        printf("Error: Recipient address must start with '0x'\n");
-        return 0;
-    }
-
-    // Validate hex characters after '0x'
-    for (int i = 2; i < 8; i++) {
-        if (!isxdigit((unsigned char)tx->sender[i])) {
-            printf("Error: Invalid hex character in sender address at position %d\n", i);
-            return 0;
-        }
-        if (!isxdigit((unsigned char)tx->recipient[i])) {
-            printf("Error: Invalid hex character in recipient address at position %d\n", i);
-            return 0;
-        }
-    }
-
-    // Check balance
-    double balance = get_account_balance(tx->sender);
-    if (balance < (tx->amount + tx->fee)) {
-        printf("Error: Insufficient balance (%.2f) for transaction (%.2f + %.2f fee)\n",
-               balance, tx->amount, tx->fee);
+    if (!validate_address_format(tx->recipient)) {
         return 0;
     }
 
@@ -716,33 +731,48 @@ int validate_transaction(Transaction* tx) {
         return 0;
     }
 
+    // Check sender has sufficient balance
+    double balance = get_account_balance(tx->sender);
+    if (balance < tx->amount + tx->fee) {
+        printf("Error: Insufficient balance (%.2f %s). Need %.2f %s\n", 
+               balance, CURRENCY_SYMBOL, tx->amount + tx->fee, CURRENCY_SYMBOL);
+        return 0;
+    }
+
     return 1;
 }
 
 /**
  * is_double_spend
  * 
- * Checks if a transaction is attempting to double spend:
- * - Looks for transactions with same sender and timestamp
+ * Checks if a transaction would result in double spending:
+ * - Calculates total balance of sender
+ * - Compares with transaction amount + fee
+ * - Considers all existing transactions in the chain
  * 
  * Parameters:
  *   tx: Transaction to check
  * 
  * Returns:
  *   1 if double spend detected
- *   0 if transaction is unique
+ *   0 if transaction is valid
  */
 int is_double_spend(Transaction* tx) {
-    Transaction* current = chain_head;
+    if (!tx) return 1;  // Invalid transaction
     
-    while (current != NULL) {
-        // Look for another transaction with same sender and timestamp
-        if (current != tx && 
-            strcmp(current->sender, tx->sender) == 0 &&
-            current->timestamp == tx->timestamp) {
-            return 1;
-        }
-        current = current->next;
+    // Mining rewards can't be double spends
+    if (strcmp(tx->sender, MINING_REWARD_SENDER) == 0) {
+        return 0;
+    }
+    
+    // Calculate sender's balance
+    double balance = get_account_balance(tx->sender);
+    
+    // Check if balance is sufficient
+    if (balance < tx->amount + tx->fee) {
+        printf("Double spend detected: Balance %.2f %s, trying to spend %.2f %s\n",
+               balance, CURRENCY_SYMBOL, tx->amount + tx->fee, CURRENCY_SYMBOL);
+        return 1;
     }
     
     return 0;
@@ -751,7 +781,7 @@ int is_double_spend(Transaction* tx) {
 /**
  * get_transaction_count
  * 
- * Counts total number of transactions in the chain
+ * Counts the total number of transactions in the blockchain
  * 
  * Returns:
  *   Total number of transactions
@@ -917,60 +947,62 @@ double get_total_supply(void) {
 /**
  * get_chain_modified_time
  * 
- * Gets the last modification time of the chain file
+ * Retrieves the last modification time of the chain file
+ * Used for detecting external changes to the chain
  * 
  * Returns:
- *   Modification timestamp
- *   0 if file doesn't exist
+ *   Modification time as time_t
+ *   0 if file does not exist or error occurs
  */
 time_t get_chain_modified_time(void) {
     struct stat st;
     if (stat(CHAIN_FILE, &st) == 0) {
         return st.st_mtime;
     }
-    return 0;  // File doesn't exist
+    return 0;  // File doesn't exist or error
 }
 
 /**
  * has_chain_changed
  * 
- * Monitors blockchain file for updates from other instances:
- * - Checks modification time
- * - Throttles checks to once per second
- * - Handles file existence
+ * Determines if the chain file has been modified since last check
+ * Used to detect changes made by another instance of the program
+ * Implements rate limiting to avoid excessive file system checks
  * 
  * Returns:
- *   1 if chain needs reload
- *   0 if chain is current
+ *   1 if chain has changed externally
+ *   0 if unchanged or cannot determine
  */
 int has_chain_changed(void) {
-    time_t current_time = time(NULL);
-    
-    // Throttle checks to once per second
-    if (current_time - last_check_time < 1) {
+    // Rate limiting - check at most once per second
+    time_t now = time(NULL);
+    if (now - last_check_time < 1) {
         return 0;
     }
     
-    last_check_time = current_time;
-    time_t file_time = get_chain_modified_time();
+    last_check_time = now;
     
-    // If file doesn't exist or hasn't changed
-    if (file_time == 0 || file_time <= last_known_time) {
-        return 0;
+    // Get file modification time
+    time_t current_mod_time = get_chain_modified_time();
+    if (current_mod_time == 0) {
+        return 0;  // File doesn't exist or error
     }
     
-    // File has been modified
-    last_known_time = file_time;
-    return 1;
+    // If file has been modified since last check
+    if (current_mod_time > last_known_time) {
+        return 1;
+    }
+    
+    return 0;
 }
 
 /**
  * perform_proof_of_work
  * 
- * Performs the mining proof-of-work algorithm:
- * - Generates hashes with increasing nonce
- * - Checks for required number of leading zeros
- * - Can be interrupted by chain updates
+ * Implements the mining algorithm:
+ * - Increments nonce until hash starts with specified zeros
+ * - Monitors for chain updates if requested
+ * - Reports progress during mining
  * 
  * Parameters:
  *   tx: Transaction to mine
@@ -984,9 +1016,7 @@ static int perform_proof_of_work(Transaction* tx, int check_updates) {
     printf("\nFinding hash with %d leading zeros...\n\n", DIFFICULTY);
     unsigned int nonce = 0;
     char data[512];
-    char zeros[DIFFICULTY + 1];
-    memset(zeros, '0', DIFFICULTY);
-    zeros[DIFFICULTY] = '\0';
+    const char* difficulty_prefix = get_difficulty_prefix(DIFFICULTY);
 
     printf("═══════════════════════════════════════\n");
     do {
@@ -1001,6 +1031,7 @@ static int perform_proof_of_work(Transaction* tx, int check_updates) {
             }
         }
         
+        // Generate hash with current nonce
         snprintf(data, sizeof(data), "%s%s%.2f%.2f%s%u%ld",
                 tx->sender, tx->recipient, tx->amount, tx->fee,
                 tx->prev_hash, nonce, tx->timestamp);
@@ -1008,10 +1039,11 @@ static int perform_proof_of_work(Transaction* tx, int check_updates) {
         tx->data_hash[sizeof(tx->data_hash) - 1] = '\0';
         
         nonce++;
-    } while (memcmp(tx->data_hash, zeros, DIFFICULTY) != 0);
+    } while (strncmp(tx->data_hash, difficulty_prefix, DIFFICULTY) != 0);
 
     printf("\n\nBlock mined!\n");
     printf("Hash    : %s\n", tx->data_hash);
     
     return 1;
 }
+

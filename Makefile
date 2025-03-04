@@ -11,7 +11,7 @@ BUILD_DIR = build
 SRC_DIR = .
 
 # Core source files (excluding main.c)
-CORE_SRCS = blockchain.c crypto.c
+CORE_SRCS = blockchain.c blockchain_utils.c crypto.c
 CORE_OBJS = $(CORE_SRCS:%.c=$(BUILD_DIR)/%.o)
 
 # Main program
